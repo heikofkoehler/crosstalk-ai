@@ -1,0 +1,7 @@
+{
+  "name": "Crosstalk Español",
+  "description": "Learn Spanish through Crosstalk: I speak Spanish and draw pictures, you speak English.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

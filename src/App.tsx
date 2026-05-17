@@ -27,6 +27,7 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   text: string;
+  translation?: string;
   svg?: string;
   level?: Level;
   audioUrl?: string;
@@ -35,6 +36,7 @@ interface Message {
 interface AIResponse {
   spanish_text: string;
   svg_draw: string;
+  user_translation: string;
 }
 
 const LEVELS: Level[] = ["Superbeginner", "Beginner", "Intermediate"];
@@ -57,6 +59,7 @@ export default function App() {
   const [showLevelMenu, setShowLevelMenu] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isAutoPlay, setIsAutoPlay] = useState(true);
+  const [showTranslations, setShowTranslations] = useState(true);
   const [currentlyPlayingId, setCurrentlyPlayingId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -220,9 +223,10 @@ export default function App() {
         - Always respond in Spanish. NEVER use English.
         - The user speaks English.
         - Your goal is to help them understand Spanish through context and visual aids.
-        - For every response, provide a JSON object with two fields:
+        - For every response, provide a JSON object with three fields:
           1. "spanish_text": Your response in Spanish.
           2. "svg_draw": ONLY the inner SVG elements (paths, circles, rects, etc.) for a 100x100 canvas. Use colors to make it clear.
+          3. "user_translation": A clear and natural translation of the user's English input into Spanish.
         - Adapt your vocabulary frequency and complexity based on the user's level: ${level}.
         - If the user says "[SIMPLIFY]" or expresses confusion, immediately simplify your Spanish and make your drawing even more basic and explicit.
         - Correlate the drawing with your Spanish text.
@@ -246,14 +250,20 @@ export default function App() {
             type: Type.OBJECT,
             properties: {
               spanish_text: { type: Type.STRING },
-              svg_draw: { type: Type.STRING }
+              svg_draw: { type: Type.STRING },
+              user_translation: { type: Type.STRING }
             },
-            required: ["spanish_text", "svg_draw"]
+            required: ["spanish_text", "svg_draw", "user_translation"]
           }
         }
       });
 
       const data = JSON.parse(response.text) as AIResponse;
+      
+      // Update user message with translation
+      setMessages(prev => prev.map(m => 
+        m.id === userMessage.id ? { ...m, translation: data.user_translation } : m
+      ));
       
       // Generate TTS in parallel
       const audioUrl = await generateTTS(data.spanish_text);
@@ -405,6 +415,12 @@ export default function App() {
                   )}>
                     {msg.text}
                     
+                    {msg.role === "user" && msg.translation && showTranslations && (
+                      <div className="mt-2 pt-2 border-t border-white/20 text-xs font-medium opacity-90 italic">
+                        {msg.translation}
+                      </div>
+                    )}
+                    
                     {msg.role === "assistant" && msg.audioUrl && (
                       <button 
                         onClick={() => playAudio(msg.audioUrl!, msg.id)}
@@ -528,7 +544,7 @@ export default function App() {
           <div className="space-y-4">
             <h3 className="font-bold text-sm text-[#4A4A4A] flex items-center gap-2">
               <Settings size={16} className="text-[#8E8E8E]" />
-              Voice Controls
+              Learning Controls
             </h3>
             <div className="space-y-3">
               <div className="flex items-center justify-between p-3 bg-[#F9F9F9] rounded-2xl">
@@ -546,8 +562,23 @@ export default function App() {
                   )} />
                 </button>
               </div>
+              <div className="flex items-center justify-between p-3 bg-[#F9F9F9] rounded-2xl">
+                <span className="text-xs font-medium text-[#6E6E6E]">User Translations</span>
+                <button 
+                  onClick={() => setShowTranslations(!showTranslations)}
+                  className={cn(
+                    "w-10 h-5 rounded-full transition-all relative",
+                    showTranslations ? "bg-[#4A90E2]" : "bg-[#DDD]"
+                  )}
+                >
+                  <div className={cn(
+                    "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                    showTranslations ? "right-1" : "left-1"
+                  )} />
+                </button>
+              </div>
               <p className="text-[10px] text-[#8E8E8E] leading-relaxed">
-                When enabled, I will speak my Spanish responses automatically using Gemini TTS.
+                Enable translations to see your English input in Spanish. Great for learning how to express your thoughts!
               </p>
             </div>
           </div>

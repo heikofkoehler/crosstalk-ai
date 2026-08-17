@@ -1,7 +1,10 @@
 {
   "name": "Crosstalk Español",
-  "description": "Learn Spanish through Crosstalk: I speak Spanish and draw pictures, you speak English.",
+  "description": "Learn Spanish through Crosstalk with real-time practice time tracking, adaptive CEFR pedagogy levels, Gemini TTS speech, and visual drawings.",
   "requestFramePermissions": [
     "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]
 }

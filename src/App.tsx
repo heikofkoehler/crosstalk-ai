@@ -188,8 +188,48 @@ export default function App() {
     }
   }, [recordUserActivity]);
 
+  // Pre-load and sync browser voices
+  useEffect(() => {
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.getVoices();
+      const onVoicesChanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+      window.speechSynthesis.onvoiceschanged = onVoicesChanged;
+      return () => {
+        if (window.speechSynthesis) {
+          window.speechSynthesis.onvoiceschanged = null;
+        }
+      };
+    }
+  }, []);
+
+  // Unlock AudioContext and speech synthesis on user interaction
+  const unlockAudio = useCallback(() => {
+    try {
+      if (!audioContextRef.current) {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtx) {
+          audioContextRef.current = new AudioCtx({ sampleRate: 24000 });
+        }
+      }
+      if (audioContextRef.current && audioContextRef.current.state === "suspended") {
+        audioContextRef.current.resume().catch(() => {});
+      }
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.getVoices();
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+      }
+    } catch (e) {
+      console.warn("Audio unlock warning:", e);
+    }
+  }, []);
+
   const toggleListening = () => {
     recordUserActivity();
+    unlockAudio();
     if (isListening) {
       recognitionRef.current?.stop();
     } else {
@@ -207,18 +247,74 @@ export default function App() {
       });
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        console.error("TTS API error:", errorData);
+        console.warn("Cloud TTS endpoint notice (will use browser synthesis if needed):", errorData);
         return null;
       }
       const data = await res.json();
       return data.audioBase64 || null;
     } catch (error) {
-      console.error("Error generating TTS:", error);
+      console.warn("TTS fetch notice:", error);
     }
     return null;
   };
 
+  const playBrowserSpeech = (text: string, id: string) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      setCurrentlyPlayingId(null);
+      return;
+    }
+
+    try {
+      window.speechSynthesis.cancel();
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+
+      if (currentlyPlayingId === id) {
+        setCurrentlyPlayingId(null);
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "es-ES";
+      utterance.rate = level === "Superbeginner" ? 0.85 : level === "Beginner" ? 0.95 : 1.05;
+
+      const voices = window.speechSynthesis.getVoices();
+      const esVoice = voices.find(
+        (v) =>
+          v.lang.toLowerCase().startsWith("es") ||
+          v.name.toLowerCase().includes("spanish") ||
+          v.lang.toLowerCase().includes("es-")
+      );
+      if (esVoice) {
+        utterance.voice = esVoice;
+      }
+
+      utterance.onstart = () => {
+        setCurrentlyPlayingId(id);
+      };
+      utterance.onend = () => {
+        setCurrentlyPlayingId(null);
+      };
+      utterance.onerror = (e) => {
+        console.warn("Browser speech notice:", e);
+        setCurrentlyPlayingId(null);
+      };
+
+      setCurrentlyPlayingId(id);
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      console.warn("Browser speech failed:", err);
+      setCurrentlyPlayingId(null);
+    }
+  };
+
   const stopAudio = () => {
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {}
+    }
     if (audioSourceRef.current) {
       try {
         audioSourceRef.current.stop();
@@ -230,8 +326,10 @@ export default function App() {
     setCurrentlyPlayingId(null);
   };
 
-  const playAudio = async (base64Data: string, id: string) => {
+  const playAudio = async (base64Data: string | undefined, id: string, fallbackText?: string) => {
     recordUserActivity();
+    unlockAudio();
+
     if (currentlyPlayingId === id) {
       stopAudio();
       return;
@@ -239,13 +337,28 @@ export default function App() {
 
     stopAudio();
 
+    if (!base64Data) {
+      if (fallbackText) {
+        playBrowserSpeech(fallbackText, id);
+      }
+      return;
+    }
+
     try {
       if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtx) {
+          audioContextRef.current = new AudioCtx({ sampleRate: 24000 });
+        }
       }
       
       const audioContext = audioContextRef.current;
-      if (audioContext.state === 'suspended') {
+      if (!audioContext) {
+        if (fallbackText) playBrowserSpeech(fallbackText, id);
+        return;
+      }
+
+      if (audioContext.state === "suspended") {
         await audioContext.resume();
       }
 
@@ -256,14 +369,20 @@ export default function App() {
         bytes[i] = binaryString.charCodeAt(i);
       }
       
-      // 16-bit PCM
-      const int16Array = new Int16Array(bytes.buffer);
-      const float32Array = new Float32Array(int16Array.length);
-      for (let i = 0; i < int16Array.length; i++) {
-        float32Array[i] = int16Array[i] / 32768;
+      // Safe 16-bit PCM conversion with DataView
+      const dataView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const numSamples = Math.floor(bytes.byteLength / 2);
+      if (numSamples <= 0) {
+        if (fallbackText) playBrowserSpeech(fallbackText, id);
+        return;
+      }
+
+      const float32Array = new Float32Array(numSamples);
+      for (let i = 0; i < numSamples; i++) {
+        float32Array[i] = dataView.getInt16(i * 2, true) / 32768; // little-endian
       }
       
-      const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
+      const audioBuffer = audioContext.createBuffer(1, numSamples, 24000);
       audioBuffer.getChannelData(0).set(float32Array);
       
       const source = audioContext.createBufferSource();
@@ -281,14 +400,19 @@ export default function App() {
       audioSourceRef.current = source;
       source.start();
     } catch (err) {
-      console.error("Error playing PCM:", err);
-      setCurrentlyPlayingId(null);
+      console.warn("PCM audio playback notice, switching to browser synthesis:", err);
+      if (fallbackText) {
+        playBrowserSpeech(fallbackText, id);
+      } else {
+        setCurrentlyPlayingId(null);
+      }
     }
   };
 
   const sendMessage = async (e?: React.FormEvent, overrideInput?: string) => {
     if (e) e.preventDefault();
     recordUserActivity();
+    unlockAudio();
     const currentInput = overrideInput || input;
     if (!currentInput.trim() || isLoading) return;
 
@@ -311,11 +435,16 @@ export default function App() {
     });
 
     try {
+      const trimmedHistory = messages.slice(-20).map(m => ({
+        role: m.role,
+        text: m.text
+      }));
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: messages,
+          messages: trimmedHistory,
           input: currentInput,
           level: level,
         }),
@@ -349,15 +478,22 @@ export default function App() {
 
       setMessages(prev => [...prev, assistantMessage]);
 
-      if (isAutoPlay && audioUrl) {
-        playAudio(audioUrl, assistantMessage.id);
+      if (isAutoPlay) {
+        playAudio(audioUrl || undefined, assistantMessage.id, data.spanish_text);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error communicating with Crosstalk server:", error);
+      const errMsg = error?.message || String(error);
+      const isQuotaOrBusy = errMsg.includes("429") || errMsg.includes("503") || errMsg.includes("quota") || errMsg.includes("high demand") || errMsg.includes("RESOURCE_EXHAUSTED");
+      
+      const userFriendlyText = isQuotaOrBusy
+        ? "El modelo de IA está procesando muchas solicitudes en este momento. Por favor, espera unos segundos y presiona enviar de nuevo."
+        : "Lo siento, hubo un error al conectar con el servidor. ¿Puedes intentar de nuevo?";
+
       setMessages(prev => [...prev, {
         id: "error-" + Date.now(),
         role: "assistant",
-        text: "Lo siento, hubo un error al conectar con el servidor. ¿Puedes intentar de nuevo?",
+        text: userFriendlyText,
         svg: '<circle cx="50" cy="50" r="40" fill="#FF6B6B" opacity="0.2" /><path d="M30 70 Q50 50 70 70" stroke="#FF6B6B" stroke-width="3" fill="none" /><circle cx="40" cy="40" r="3" fill="#FF6B6B" /><circle cx="60" cy="40" r="3" fill="#FF6B6B" />'
       }]);
     } finally {
@@ -551,9 +687,9 @@ export default function App() {
                       </div>
                     )}
                     
-                    {msg.role === "assistant" && msg.audioUrl && (
+                    {msg.role === "assistant" && (
                       <button 
-                        onClick={() => playAudio(msg.audioUrl!, msg.id)}
+                        onClick={() => playAudio(msg.audioUrl, msg.id, msg.text)}
                         className={cn(
                           "absolute -right-9 top-0 p-1.5 sm:p-2 rounded-full transition-all opacity-0 group-hover:opacity-100",
                           currentlyPlayingId === msg.id ? "bg-[#FF6B6B] text-white opacity-100" : "bg-[#F5F5F5] text-[#8E8E8E] hover:text-[#FF6B6B]"

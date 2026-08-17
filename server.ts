@@ -12,14 +12,59 @@ function getGeminiClient(): GoogleGenAI {
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY environment variable is missing.");
   }
-  return new GoogleGenAI({ apiKey });
+  return new GoogleGenAI({ 
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build'
+      }
+    }
+  });
+}
+
+const CHAT_MODELS = [
+  "gemini-3.1-flash-lite",
+  "gemini-flash-latest",
+  "gemini-3.7-flash"
+];
+
+const TTS_MODELS = [
+  "gemini-3.1-flash-tts-preview"
+];
+
+async function callChatWithResilience(ai: GoogleGenAI, payload: any): Promise<any> {
+  let lastErr: any = null;
+  for (const model of CHAT_MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          ...payload,
+          model
+        });
+        if (response && response.text) {
+          return response;
+        }
+      } catch (err: any) {
+        lastErr = err;
+        console.warn(`Chat model ${model} attempt ${attempt + 1} failed: ${err?.message || err}`);
+        const errMsg = err?.message || String(err);
+        if (errMsg.includes("503") || err?.status === 503 || errMsg.includes("429") || errMsg.includes("high demand") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+          await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
+        } else {
+          break; // move to next valid model if not a transient rate limit
+        }
+      }
+    }
+  }
+  throw lastErr || new Error("All language models are currently experiencing high demand. Please try again in a few moments.");
 }
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // API: Health check
   app.get("/api/health", (_req, res) => {
@@ -97,8 +142,7 @@ Always return a valid JSON object with exactly three fields:
           }))
         : [];
 
-      const response = await ai.models.generateContent({
-        model: "gemini-flash-latest",
+      const response = await callChatWithResilience(ai, {
         contents: [
           ...history,
           { role: "user", parts: [{ text: input }] }
@@ -119,7 +163,17 @@ Always return a valid JSON object with exactly three fields:
       });
 
       const responseText = response.text || "{}";
-      const data = JSON.parse(responseText);
+      let data: any;
+      try {
+        data = JSON.parse(responseText);
+      } catch (parseErr) {
+        const match = responseText.match(/\{[\s\S]*\}/);
+        if (match) {
+          data = JSON.parse(match[0]);
+        } else {
+          throw new Error("Unable to parse model JSON response");
+        }
+      }
 
       return res.json(data);
     } catch (error: any) {
@@ -140,22 +194,36 @@ Always return a valid JSON object with exactly three fields:
       }
 
       const ai = getGeminiClient();
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-tts-preview",
-        contents: [{ parts: [{ text: `Di esto con entusiasmo: ${text}` }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: "Kore" }
-            }
-          }
-        }
-      });
+      let base64Audio: string | undefined;
+      let lastTtsError: any = null;
 
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      for (const ttsModel of TTS_MODELS) {
+        try {
+          const response = await ai.models.generateContent({
+            model: ttsModel,
+            contents: [{ parts: [{ text: `Di esto con entusiasmo en español: ${text}` }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: "Kore" }
+                }
+              }
+            }
+          });
+          base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (base64Audio) break;
+        } catch (err: any) {
+          console.warn(`TTS model ${ttsModel} failed:`, err?.message || err);
+          lastTtsError = err;
+        }
+      }
+
       if (!base64Audio) {
-        return res.status(500).json({ error: "No audio data received from Gemini TTS." });
+        return res.status(429).json({ 
+          error: "TTS voice synthesis currently busy or quota reached.", 
+          details: String(lastTtsError) 
+        });
       }
 
       return res.json({ audioBase64: base64Audio });

@@ -23,71 +23,148 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 const CHAT_MODELS = [
-  "gemini-3.1-flash-lite",
   "gemini-flash-latest",
-  "gemini-3.7-flash"
+  "gemini-3.7-flash",
+  "gemini-3.1-flash-lite"
 ];
 
 const TTS_MODELS = [
   "gemini-3.1-flash-tts-preview"
 ];
 
+// Timestamp until which cloud TTS is paused due to free-tier quota exhaustion (10 reqs/day) or rate limits
+let ttsQuotaExceededUntil = 0;
+
 async function generateSpeechWithResilience(ai: GoogleGenAI, text: string): Promise<string | null> {
+  const cleanText = (text || "").trim();
+  if (!cleanText) return null;
+
+  // If in quota/rate limit cooldown, bypass immediately without wasting calls or generating logs
+  if (Date.now() < ttsQuotaExceededUntil) {
+    return null;
+  }
+
   for (const ttsModel of TTS_MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model: ttsModel,
-          contents: [{ parts: [{ text: `Di esto con entusiasmo en español: ${text}` }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: "Kore" }
-              }
+    try {
+      const response = await ai.models.generateContent({
+        model: ttsModel,
+        contents: [{ parts: [{ text: cleanText }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: "Kore" }
             }
           }
-        });
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (base64Audio) return base64Audio;
-      } catch (err: any) {
-        const errMsg = err?.message || String(err);
-        console.warn(`TTS attempt ${attempt + 1} (${ttsModel}) notice: ${errMsg}`);
-        if (errMsg.includes("503") || err?.status === 503 || errMsg.includes("429") || errMsg.includes("high demand") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-          await new Promise(res => setTimeout(res, 500 * (attempt + 1)));
-        } else {
-          break;
+        }
+      });
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) return base64Audio;
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      
+      // If free-tier quota exceeded (10 reqs/day limit) or rate limited
+      if (
+        errMsg.includes("RESOURCE_EXHAUSTED") || 
+        errMsg.includes("429") || 
+        errMsg.includes("Quota exceeded") || 
+        errMsg.includes("quota")
+      ) {
+        // Pause cloud TTS calls for 60 seconds so browser voice takes over smoothly with 0 latency
+        ttsQuotaExceededUntil = Date.now() + 60 * 1000;
+        return null;
+      }
+
+      // If temporary 503 high demand, try one fast retry after 500ms
+      if (errMsg.includes("503") || err?.status === 503 || errMsg.includes("high demand") || errMsg.includes("UNAVAILABLE")) {
+        try {
+          await new Promise(r => setTimeout(r, 500));
+          const retryRes = await ai.models.generateContent({
+            model: ttsModel,
+            contents: [{ parts: [{ text: cleanText }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: "Kore" }
+                }
+              }
+            }
+          });
+          const retryAudio = retryRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (retryAudio) return retryAudio;
+        } catch {
+          return null;
         }
       }
+
+      return null;
     }
   }
   return null;
 }
 
+// Model cooldown map for models that return 503 / high demand
+const modelCooldownMap = new Map<string, number>();
+
 async function callChatWithResilience(ai: GoogleGenAI, payload: any): Promise<any> {
   let lastErr: any = null;
-  for (const model of CHAT_MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          ...payload,
-          model
-        });
-        if (response && response.text) {
-          return response;
-        }
-      } catch (err: any) {
-        lastErr = err;
-        console.warn(`Chat model ${model} attempt ${attempt + 1} failed: ${err?.message || err}`);
-        const errMsg = err?.message || String(err);
-        if (errMsg.includes("503") || err?.status === 503 || errMsg.includes("429") || errMsg.includes("high demand") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-          await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
-        } else {
-          break; // move to next valid model if not a transient rate limit
-        }
+  const now = Date.now();
+
+  // Order models: first those not in cooldown, then the rest
+  const sortedModels = [...CHAT_MODELS].sort((a, b) => {
+    const aCooldown = (modelCooldownMap.get(a) || 0) > now ? 1 : 0;
+    const bCooldown = (modelCooldownMap.get(b) || 0) > now ? 1 : 0;
+    return aCooldown - bCooldown;
+  });
+
+  // Try each model in sequence
+  for (const model of sortedModels) {
+    try {
+      const response = await ai.models.generateContent({
+        ...payload,
+        model
+      });
+      if (response && response.text) {
+        // Success: clear cooldown for this model
+        modelCooldownMap.delete(model);
+        return response;
+      }
+    } catch (err: any) {
+      lastErr = err;
+      const errMsg = err?.message || String(err);
+      if (errMsg.includes("503") || err?.status === 503 || errMsg.includes("high demand") || errMsg.includes("UNAVAILABLE")) {
+        // Mark model as experiencing temporary spike for 30 seconds so next calls go to other models immediately
+        modelCooldownMap.set(model, Date.now() + 30 * 1000);
+        // Continue to the next sibling model immediately without delay
+        continue;
+      } else if (errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+        modelCooldownMap.set(model, Date.now() + 60 * 1000);
+        continue;
+      } else {
+        // If it's a structural error, move to next model
+        continue;
       }
     }
   }
+
+  // If all models failed on the first pass, do one short-delayed second attempt on non-cooldown models
+  await new Promise(res => setTimeout(res, 500));
+  for (const model of CHAT_MODELS) {
+    try {
+      const response = await ai.models.generateContent({
+        ...payload,
+        model
+      });
+      if (response && response.text) {
+        modelCooldownMap.delete(model);
+        return response;
+      }
+    } catch (err: any) {
+      lastErr = err;
+    }
+  }
+
   throw lastErr || new Error("All language models are currently experiencing high demand. Please try again in a few moments.");
 }
 
@@ -97,6 +174,7 @@ async function startServer() {
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.use(express.text({ limit: "50mb" }));
 
   // API: Health check
   app.get("/api/health", (_req, res) => {
@@ -168,10 +246,13 @@ Always return a valid JSON object with exactly three fields:
 `;
 
       const history = Array.isArray(messages)
-        ? messages.map((m: { role: string; text: string }) => ({
-            role: m.role === "assistant" ? "model" : "user",
-            parts: [{ text: m.text }]
-          }))
+        ? messages
+            .filter((m: any) => m && m.text && !String(m.id || "").startsWith("error-"))
+            .slice(-8)
+            .map((m: any) => ({
+              role: m.role === "assistant" || m.role === "model" ? "model" : "user",
+              parts: [{ text: String(m.text).slice(0, 500) }]
+            }))
         : [];
 
       const response = await callChatWithResilience(ai, {
@@ -210,8 +291,17 @@ Always return a valid JSON object with exactly three fields:
       return res.json(data);
     } catch (error: any) {
       console.error("Error in /api/chat:", error);
+      const rawMsg = error?.message || String(error);
+      let userMsg = "Failed to process chat message. Please try again.";
+      if (rawMsg.includes("503") || rawMsg.includes("high demand") || rawMsg.includes("UNAVAILABLE")) {
+        userMsg = "The AI service is experiencing a temporary spike in demand. Please try sending your message again in a moment.";
+      } else if (rawMsg.includes("429") || rawMsg.includes("RESOURCE_EXHAUSTED") || rawMsg.includes("quota")) {
+        userMsg = "Rate limit reached. Please wait a few seconds and try again.";
+      } else if (error?.message && !error.message.startsWith("{")) {
+        userMsg = error.message;
+      }
       return res.status(500).json({ 
-        error: error.message || "Failed to process chat message",
+        error: userMsg,
         details: String(error)
       });
     }
@@ -246,6 +336,15 @@ Always return a valid JSON object with exactly three fields:
         message: "TTS fallback to browser speech synthesis" 
       });
     }
+  });
+
+  // API Error handler for payload limits or JSON malformation
+  app.use("/api", (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.warn("API middleware error caught:", err?.message || err);
+    if (err?.type === "entity.too.large" || err?.status === 413) {
+      return res.status(413).json({ error: "Payload too large. Please send a shorter message." });
+    }
+    return res.status(err?.status || 500).json({ error: err?.message || "Server error processing request" });
   });
 
   // Vite middleware for development vs static build for production

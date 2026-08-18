@@ -21,7 +21,8 @@ import {
   Pause,
   RotateCcw,
   BarChart3,
-  Target
+  Target,
+  Sliders
 } from "lucide-react";
 import { cn } from "./lib/utils";
 import { Level, Message, AIResponse, PracticeStats } from "./types";
@@ -34,11 +35,15 @@ import {
   getDefaultStats 
 } from "./lib/practiceStorage";
 import { PracticeStatsModal } from "./components/PracticeStatsModal";
+import { VoiceSettingsModal } from "./components/VoiceSettingsModal";
 
 const LEVELS: Level[] = ["Superbeginner", "Beginner", "Intermediate"];
 
-// Speech Recognition Setup
-const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+// Speech Recognition Helper
+const getSpeechRecognitionClass = () => {
+  if (typeof window === "undefined") return null;
+  return (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition || null;
+};
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
@@ -69,6 +74,23 @@ export default function App() {
   const [isTimerActive, setIsTimerActive] = useState(true);
   const [isIdle, setIsIdle] = useState(false);
   const [showStatsModal, setShowStatsModal] = useState(false);
+  const [showVoiceModal, setShowVoiceModal] = useState(false);
+  const [systemVoices, setSystemVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>(() => {
+    try {
+      return localStorage.getItem("crosstalk_selected_voice_uri") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [speechRate, setSpeechRate] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("crosstalk_speech_rate");
+      return saved ? parseFloat(saved) : 1.0;
+    } catch {
+      return 1.0;
+    }
+  });
   const lastActivityRef = useRef<number>(Date.now());
   const statsRef = useRef<PracticeStats>(stats);
   statsRef.current = stats;
@@ -162,47 +184,79 @@ export default function App() {
 
   // Speech Recognition Initialization
   useEffect(() => {
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = "en-US";
+    const SpeechRecognitionClass = getSpeechRecognitionClass();
+    if (SpeechRecognitionClass) {
+      try {
+        const recognition = new SpeechRecognitionClass();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = "en-US";
 
-      recognition.onresult = (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        setInput(transcript);
-        setIsListening(false);
-        recordUserActivity();
-      };
+        recognition.onresult = (event: any) => {
+          const transcript = event.results[0][0].transcript;
+          setInput(transcript);
+          setIsListening(false);
+          recordUserActivity();
+        };
 
-      recognition.onerror = (event: any) => {
-        console.error("Speech recognition error:", event.error);
-        setIsListening(false);
-      };
+        recognition.onerror = (event: any) => {
+          console.warn("Speech recognition notice:", event.error);
+          setIsListening(false);
+        };
 
-      recognition.onend = () => {
-        setIsListening(false);
-      };
+        recognition.onend = () => {
+          setIsListening(false);
+        };
 
-      recognitionRef.current = recognition;
+        recognitionRef.current = recognition;
+      } catch (e) {
+        console.warn("Speech recognition init warning:", e);
+      }
     }
   }, [recordUserActivity]);
 
   // Pre-load and sync browser voices
+  const refreshVoices = useCallback(() => {
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      const v = window.speechSynthesis.getVoices();
+      if (v && v.length > 0) {
+        setSystemVoices(v);
+        // Auto-select natural Spanish voice if nothing is chosen yet
+        setSelectedVoiceURI(prev => {
+          if (prev) return prev;
+          const spanish = v.filter(item => 
+            item.lang.toLowerCase().startsWith("es") || 
+            item.name.toLowerCase().includes("spanish") ||
+            item.name.toLowerCase().includes("español")
+          );
+          const best = spanish.find(item => 
+            item.name.includes("Google") || 
+            item.name.includes("Natural") || 
+            item.name.includes("Neural") || 
+            item.name.includes("Premium") ||
+            item.name.includes("Monica") ||
+            item.name.includes("Paulina") ||
+            item.name.includes("Jorge") ||
+            item.name.includes("Sabina") ||
+            item.name.includes("Helena")
+          ) || spanish[0];
+          return best ? best.voiceURI : "";
+        });
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.getVoices();
-      const onVoicesChanged = () => {
-        window.speechSynthesis.getVoices();
-      };
-      window.speechSynthesis.onvoiceschanged = onVoicesChanged;
+      refreshVoices();
+      window.speechSynthesis.onvoiceschanged = refreshVoices;
       return () => {
         if (window.speechSynthesis) {
           window.speechSynthesis.onvoiceschanged = null;
         }
       };
     }
-  }, []);
+  }, [refreshVoices]);
 
   // Unlock AudioContext and speech synthesis on user interaction
   const unlockAudio = useCallback(() => {
@@ -276,18 +330,43 @@ export default function App() {
       }
 
       const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "es-ES";
-      utterance.rate = level === "Superbeginner" ? 0.85 : level === "Beginner" ? 0.95 : 1.05;
+      
+      // Calculate effective speed based on user preference + pedagogical level
+      const levelMultiplier = level === "Superbeginner" ? 0.9 : level === "Beginner" ? 0.97 : 1.05;
+      utterance.rate = Math.max(0.6, Math.min(1.5, speechRate * levelMultiplier));
+      utterance.pitch = 1.0;
 
-      const voices = window.speechSynthesis.getVoices();
-      const esVoice = voices.find(
-        (v) =>
+      const voices = systemVoices.length > 0 ? systemVoices : window.speechSynthesis.getVoices();
+      
+      // 1. Check user selected voice
+      let chosenVoice = voices.find(v => v.voiceURI === selectedVoiceURI);
+
+      // 2. If not found or not selected, prioritize natural Spanish voices
+      if (!chosenVoice) {
+        const spanishVoices = voices.filter(v => 
           v.lang.toLowerCase().startsWith("es") ||
           v.name.toLowerCase().includes("spanish") ||
-          v.lang.toLowerCase().includes("es-")
-      );
-      if (esVoice) {
-        utterance.voice = esVoice;
+          v.name.toLowerCase().includes("español")
+        );
+
+        chosenVoice = spanishVoices.find(v => 
+          v.name.includes("Google") || 
+          v.name.includes("Natural") || 
+          v.name.includes("Neural") || 
+          v.name.includes("Premium") ||
+          v.name.includes("Monica") ||
+          v.name.includes("Paulina") ||
+          v.name.includes("Jorge") ||
+          v.name.includes("Sabina") ||
+          v.name.includes("Helena")
+        ) || spanishVoices[0];
+      }
+
+      if (chosenVoice) {
+        utterance.voice = chosenVoice;
+        utterance.lang = chosenVoice.lang || "es-ES";
+      } else {
+        utterance.lang = "es-ES";
       }
 
       utterance.onstart = () => {
@@ -339,6 +418,17 @@ export default function App() {
 
     if (!base64Data) {
       if (fallbackText) {
+        // Try fetching Kore HD audio on demand before falling back
+        try {
+          const fetchedAudio = await generateTTS(fallbackText);
+          if (fetchedAudio) {
+            setMessages(prev => prev.map(m => m.id === id ? { ...m, audioUrl: fetchedAudio } : m));
+            playAudio(fetchedAudio, id, fallbackText);
+            return;
+          }
+        } catch (err) {
+          console.warn("On-demand Kore audio fetch notice:", err);
+        }
         playBrowserSpeech(fallbackText, id);
       }
       return;
@@ -435,24 +525,36 @@ export default function App() {
     });
 
     try {
-      const trimmedHistory = messages.slice(-20).map(m => ({
-        role: m.role,
-        text: m.text
-      }));
+      const trimmedHistory = messages
+        .filter(m => !m.id.startsWith("error-") && m.text)
+        .slice(-8)
+        .map(m => ({
+          role: m.role,
+          text: (m.text || "").slice(0, 500)
+        }));
 
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: trimmedHistory,
-          input: currentInput,
+          input: currentInput.slice(0, 1000),
           level: level,
         }),
       });
 
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `Server responded with status ${res.status}`);
+        const rawText = await res.text().catch(() => "");
+        let errMsg = `Server error (${res.status})`;
+        try {
+          const parsed = JSON.parse(rawText);
+          if (parsed?.error) errMsg = parsed.error;
+        } catch {
+          if (rawText.includes("Payload Too Large")) {
+            errMsg = "El mensaje o historial es demasiado largo. Por favor, intenta de nuevo.";
+          }
+        }
+        throw new Error(errMsg);
       }
 
       const data: AIResponse = await res.json();
@@ -578,6 +680,15 @@ export default function App() {
             <BarChart3 size={18} />
           </button>
 
+          {/* Voice & Pronunciation Settings Button */}
+          <button
+            onClick={() => setShowVoiceModal(true)}
+            className="p-2 text-[#6E6E6E] hover:text-[#3B82F6] hover:bg-[#EFF6FF] rounded-full transition-colors flex items-center justify-center"
+            title="Configure Spanish Voice & Speed"
+          >
+            <Sliders size={18} />
+          </button>
+
           {/* Voice Auto-play toggle */}
           <button 
             onClick={() => setIsAutoPlay(!isAutoPlay)}
@@ -691,8 +802,8 @@ export default function App() {
                       <button 
                         onClick={() => playAudio(msg.audioUrl, msg.id, msg.text)}
                         className={cn(
-                          "absolute -right-9 top-0 p-1.5 sm:p-2 rounded-full transition-all opacity-0 group-hover:opacity-100",
-                          currentlyPlayingId === msg.id ? "bg-[#FF6B6B] text-white opacity-100" : "bg-[#F5F5F5] text-[#8E8E8E] hover:text-[#FF6B6B]"
+                          "absolute -right-9 top-0 p-1.5 sm:p-2 rounded-full transition-all opacity-80 hover:opacity-100 sm:opacity-0 sm:group-hover:opacity-100",
+                          currentlyPlayingId === msg.id ? "bg-[#FF6B6B] text-white opacity-100 sm:opacity-100" : "bg-[#F5F5F5] text-[#8E8E8E] hover:text-[#FF6B6B]"
                         )}
                         title="Play Spanish audio"
                       >
@@ -918,6 +1029,18 @@ export default function App() {
                   )} />
                 </button>
               </div>
+
+              {/* Voice & Accent Settings Trigger */}
+              <button
+                onClick={() => setShowVoiceModal(true)}
+                className="w-full flex items-center justify-between p-2.5 bg-white border border-[#EAEAEA] rounded-2xl hover:border-[#3B82F6] hover:bg-[#F8FAFC] transition-all text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <Sliders size={14} className="text-[#3B82F6]" />
+                  <span className="text-xs font-medium text-[#4A4A4A]">Voice & Accent</span>
+                </div>
+                <span className="text-[11px] font-bold text-[#3B82F6]">{speechRate}x</span>
+              </button>
             </div>
           </div>
         </aside>
@@ -932,6 +1055,28 @@ export default function App() {
         sessionTurns={sessionTurns}
         onUpdateGoal={handleUpdateGoal}
         onResetStats={handleResetStats}
+      />
+
+      {/* Voice Selection & Speed Settings Modal */}
+      <VoiceSettingsModal
+        isOpen={showVoiceModal}
+        onClose={() => setShowVoiceModal(false)}
+        voices={systemVoices}
+        selectedVoiceURI={selectedVoiceURI}
+        onSelectVoice={(uri) => {
+          setSelectedVoiceURI(uri);
+          try {
+            localStorage.setItem("crosstalk_selected_voice_uri", uri);
+          } catch {}
+        }}
+        speechRate={speechRate}
+        onSelectRate={(rate) => {
+          setSpeechRate(rate);
+          try {
+            localStorage.setItem("crosstalk_speech_rate", rate.toString());
+          } catch {}
+        }}
+        onRefreshVoices={refreshVoices}
       />
     </div>
   );

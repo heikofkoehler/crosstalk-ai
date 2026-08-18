@@ -32,6 +32,38 @@ const TTS_MODELS = [
   "gemini-3.1-flash-tts-preview"
 ];
 
+async function generateSpeechWithResilience(ai: GoogleGenAI, text: string): Promise<string | null> {
+  for (const ttsModel of TTS_MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: ttsModel,
+          contents: [{ parts: [{ text: `Di esto con entusiasmo en español: ${text}` }] }],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: "Kore" }
+              }
+            }
+          }
+        });
+        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (base64Audio) return base64Audio;
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        console.warn(`TTS attempt ${attempt + 1} (${ttsModel}) notice: ${errMsg}`);
+        if (errMsg.includes("503") || err?.status === 503 || errMsg.includes("429") || errMsg.includes("high demand") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+          await new Promise(res => setTimeout(res, 500 * (attempt + 1)));
+        } else {
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 async function callChatWithResilience(ai: GoogleGenAI, payload: any): Promise<any> {
   let lastErr: any = null;
   for (const model of CHAT_MODELS) {
@@ -194,44 +226,24 @@ Always return a valid JSON object with exactly three fields:
       }
 
       const ai = getGeminiClient();
-      let base64Audio: string | undefined;
-      let lastTtsError: any = null;
-
-      for (const ttsModel of TTS_MODELS) {
-        try {
-          const response = await ai.models.generateContent({
-            model: ttsModel,
-            contents: [{ parts: [{ text: `Di esto con entusiasmo en español: ${text}` }] }],
-            config: {
-              responseModalities: [Modality.AUDIO],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: "Kore" }
-                }
-              }
-            }
-          });
-          base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (base64Audio) break;
-        } catch (err: any) {
-          console.warn(`TTS model ${ttsModel} failed:`, err?.message || err);
-          lastTtsError = err;
-        }
-      }
+      const base64Audio = await generateSpeechWithResilience(ai, text);
 
       if (!base64Audio) {
-        return res.status(429).json({ 
-          error: "TTS voice synthesis currently busy or quota reached.", 
-          details: String(lastTtsError) 
+        // Return 200 with audioBase64: null so client seamlessly uses browser Web Speech API
+        return res.json({ 
+          audioBase64: null, 
+          fallback: true,
+          message: "TTS voice synthesis currently busy or quota reached, using browser speech synthesis." 
         });
       }
 
       return res.json({ audioBase64: base64Audio });
     } catch (error: any) {
-      console.error("Error in /api/tts:", error);
-      return res.status(500).json({ 
-        error: error.message || "Failed to generate speech",
-        details: String(error)
+      console.warn("TTS processing notice:", error?.message || error);
+      return res.json({ 
+        audioBase64: null, 
+        fallback: true,
+        message: "TTS fallback to browser speech synthesis" 
       });
     }
   });
